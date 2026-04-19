@@ -15,13 +15,15 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import logging
+import os
+import time
 
 from chirp.drivers import baofeng_common as bfc
 from chirp import chirp_common, directory, memmap, bandplan_na
 from chirp import bitwise
 from chirp.settings import RadioSetting, \
     RadioSettingValueBoolean, RadioSettingValueList, \
-    RadioSettingValueString, \
+    RadioSettingValueString, RadioSettingValueFile, \
     RadioSettings, RadioSettingGroup
 import struct
 from chirp import errors
@@ -217,6 +219,352 @@ def _upload(radio):
             radio.status_fn(status)
     return data
 
+
+# Boot screen upload — BF5RM / AR-5RM family (160×128 color display)
+
+_BS_FRAME_HDR = 0xA5
+_BS_CMD_SHAKE = 0x02
+_BS_CMD_SETADDR = 0x03
+_BS_CMD_ERASE = 0x04
+_BS_CMD_WRITE = 0x57
+_BS_CMD_OVER = 0x06
+_BS_FLASH_ADDR = 0x0C0000
+_BS_ERASE_ID = 17668    # 0x4504
+_BS_WIDTH = 160
+_BS_HEIGHT = 128
+_BS_CHUNK = 1024
+
+
+def _bs_crc16(data, offset, count):
+    """CRC-16/CCITT (poly 0x1021) over data[offset:offset+count]."""
+    crc = 0
+    for i in range(count):
+        crc ^= data[offset + i] << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+        crc &= 0xFFFF
+    return crc
+
+
+def _bs_packet(cmd, pkg_id, payload):
+    """Build a framed boot-screen protocol packet."""
+    n = len(payload)
+    frame = bytearray(6 + n + 2)
+    frame[0] = _BS_FRAME_HDR
+    frame[1] = cmd
+    frame[2] = (pkg_id >> 8) & 0xFF
+    frame[3] = pkg_id & 0xFF
+    frame[4] = (n >> 8) & 0xFF
+    frame[5] = n & 0xFF
+    frame[6:6 + n] = payload
+    crc = _bs_crc16(frame, 1, 5 + n)
+    frame[6 + n] = (crc >> 8) & 0xFF
+    frame[6 + n + 1] = crc & 0xFF
+    return bytes(frame)
+
+
+def _bs_recv(pipe, timeout=5.0):
+    """Read one framed response; returns (cmd_byte, payload) or raises."""
+    deadline = time.time() + timeout
+    buf = bytearray()
+    pipe.timeout = 0.05
+    while time.time() < deadline:
+        chunk = pipe.read(256)
+        if chunk:
+            buf.extend(chunk)
+        idx = buf.find(_BS_FRAME_HDR)
+        if idx < 0:
+            buf.clear()
+            continue
+        if idx:
+            del buf[:idx]
+        if len(buf) < 6:
+            continue
+        n = (buf[4] << 8) | buf[5]
+        needed = 6 + n + 2
+        if len(buf) < needed:
+            continue
+        frame = bytes(buf[:needed])
+        crc_rx = (frame[6 + n] << 8) | frame[6 + n + 1]
+        if crc_rx != _bs_crc16(frame, 1, 5 + n):
+            del buf[:1]
+            continue
+        return frame[1], bytes(frame[6:6 + n])
+    raise errors.RadioError("Boot screen upload timed out waiting for radio")
+
+
+def _bs_expect(pipe, expected_cmd, label, timeout=5.0):
+    cmd, payload = _bs_recv(pipe, timeout=timeout)
+    if cmd != expected_cmd or not payload or payload[0] != 0x59:
+        raise errors.RadioError(
+            "Boot screen %s failed (cmd=0x%02x payload=%r)" %
+            (label, cmd, payload))
+
+
+def _bs_read_bmp(path):
+    """
+    Read any 24-bit BMP and return a list-of-rows of (r,g,b) tuples,
+    plus (width, height).  No external dependencies.
+    """
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if raw[:2] != b'BM':
+        raise errors.RadioError("Boot screen: not a valid BMP file")
+    px_off = struct.unpack_from('<I', raw, 10)[0]
+    width = struct.unpack_from('<i', raw, 18)[0]
+    height = struct.unpack_from('<i', raw, 22)[0]
+    bpp = struct.unpack_from('<H', raw, 28)[0]
+    if bpp != 24:
+        raise errors.RadioError(
+            "Boot screen: BMP must be 24-bit RGB (got %d-bit). "
+            "Re-save as 24-bit BMP or use PNG/JPEG with "
+            "Pillow installed." % bpp)
+    flip = height > 0
+    height = abs(height)
+    row_sz = (width * 3 + 3) & ~3
+    rows = []
+    for y in range(height):
+        row = []
+        off = px_off + y * row_sz
+        for x in range(width):
+            b = raw[off + x * 3]
+            g = raw[off + x * 3 + 1]
+            r = raw[off + x * 3 + 2]
+            row.append((r, g, b))
+        rows.append(row)
+    if flip:
+        rows.reverse()
+    return rows, width, height
+
+
+def _bs_scale_nn(rows, src_w, src_h, dst_w, dst_h):
+    """Nearest-neighbour scale a rows grid to (dst_w, dst_h)."""
+    out = []
+    for y in range(dst_h):
+        sy = y * src_h // dst_h
+        row = []
+        for x in range(dst_w):
+            sx = x * src_w // dst_w
+            row.append(rows[sy][sx])
+        out.append(row)
+    return out
+
+
+def _bs_rows_to_rgb565(rows):
+    """Convert a rows grid of (r,g,b) tuples to RGB565 LE bytes."""
+    buf = bytearray()
+    for row in rows:
+        for r, g, b in row:
+            px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+            buf.append(px & 0xFF)
+            buf.append((px >> 8) & 0xFF)
+    return bytes(buf)
+
+
+def _bs_image_to_rgb565(img_path):
+    """
+    Convert any image to RGB565 LE bytes sized for the radio boot screen
+    (_BS_WIDTH × _BS_HEIGHT).  Auto-scales if the source is a different size.
+    Reads 24-bit BMP natively; all other formats require Pillow.
+    Output is padded to a whole number of _BS_CHUNK-byte blocks.
+    """
+    ext = os.path.splitext(img_path)[1].lower()
+
+    if ext == '.bmp':
+        rows, w, h = _bs_read_bmp(img_path)
+        if w != _BS_WIDTH or h != _BS_HEIGHT:
+            LOG.info("Boot screen: scaling BMP from %dx%d to %dx%d",
+                     w, h, _BS_WIDTH, _BS_HEIGHT)
+            rows = _bs_scale_nn(rows, w, h, _BS_WIDTH, _BS_HEIGHT)
+        data = _bs_rows_to_rgb565(rows)
+    else:
+        try:
+            from PIL import Image
+        except ImportError:
+            import subprocess
+            import sys
+            LOG.info("Boot screen: Pillow not found, attempting install...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, '-m', 'pip', 'install', 'Pillow'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                from PIL import Image
+            except Exception:
+                raise errors.RadioError(
+                    "Boot screen: Pillow is required for non-BMP images. "
+                    "Install it with: pip install Pillow")
+        img = Image.open(img_path).convert('RGB')
+        if img.width != _BS_WIDTH or img.height != _BS_HEIGHT:
+            LOG.info("Boot screen: scaling image from %dx%d to %dx%d",
+                     img.width, img.height, _BS_WIDTH, _BS_HEIGHT)
+            img = img.resize((_BS_WIDTH, _BS_HEIGHT), Image.LANCZOS)
+        pixels = img.load()
+        buf = bytearray(_BS_WIDTH * _BS_HEIGHT * 2)
+        for y in range(_BS_HEIGHT):
+            for x in range(_BS_WIDTH):
+                r, g, b = pixels[x, y]
+                px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                i = (y * _BS_WIDTH + x) * 2
+                buf[i] = px & 0xFF
+                buf[i + 1] = (px >> 8) & 0xFF
+        data = bytes(buf)
+
+    rem = len(data) % _BS_CHUNK
+    if rem:
+        data += b'\xFF' * (_BS_CHUNK - rem)
+    return data
+
+
+def _bs_raw_handshake(pipe):
+    """
+    Send PROGRAMBFNORMALU, wait for 0x06, reply with 0x44.
+    Drains any bytes the radio sends after 0x44.
+    Returns True on success, False on timeout.
+    """
+    pipe.reset_input_buffer()
+    pipe.write(b"PROGRAMBFNORMALU")
+    pipe.timeout = 0.1
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        b = pipe.read(1)
+        if b and b[0] == 0x06:
+            pipe.write(b'\x44')
+            # Drain any bytes the radio sends in response to 0x44
+            # (some firmware variants may echo model bytes here)
+            pipe.timeout = 0.05
+            drain_end = time.time() + 0.5
+            drain = bytearray()
+            while time.time() < drain_end:
+                rx = pipe.read(64)
+                if rx:
+                    drain.extend(rx)
+                    drain_end = time.time() + 0.05
+            if drain:
+                LOG.debug("Boot screen: radio replied to 0x44: %s",
+                          drain.hex())
+            return True
+    return False
+
+
+def _upload_boot_screen(radio, img_path):
+    """
+    Upload a boot screen image to the radio using the dedicated picture
+    protocol.  Called from BF5RM.sync_out() before the normal channel upload.
+    Uses the already-open radio.pipe serial port.
+    """
+    img_data = _bs_image_to_rgb565(img_path)
+    total = len(img_data) // _BS_CHUNK
+    pipe = radio.pipe
+    pipe.dtr = True
+    pipe.rts = True
+
+    status = chirp_common.Status()
+    status.max = total + 5   # handshake + erase + setaddr + chunks + over
+    status.cur = 0
+    status.msg = "Boot screen: connecting..."
+    radio.status_fn(status)
+
+    # 1. Raw handshake: "PROGRAMBFNORMALU" → 0x06 → 0x44 ('D')
+    for attempt in range(5):
+        if _bs_raw_handshake(pipe):
+            break
+        LOG.debug("Boot screen raw handshake retry %d", attempt + 1)
+        time.sleep(0.5)
+    else:
+        raise errors.RadioError(
+            "Boot screen: radio not responding — check cable and port")
+
+    status.cur = 1
+    status.msg = "Boot screen: handshake OK"
+    radio.status_fn(status)
+
+    # 2. PROGRAM framed handshake — retry up to 5 times.
+    # The radio may need up to ~5 seconds to enter picture mode after 0x44.
+    handshake_pkt = _bs_packet(_BS_CMD_SHAKE, 0, b"PROGRAM")
+    pipe.reset_input_buffer()
+    hs_ok = False
+    for hs_attempt in range(5):
+        pipe.write(handshake_pkt)
+        try:
+            _bs_expect(pipe, _BS_CMD_SHAKE, "HANDSHAKE", timeout=1.5)
+            hs_ok = True
+            break
+        except errors.RadioError:
+            LOG.debug("Boot screen HANDSHAKE no response (attempt %d/5)",
+                      hs_attempt + 1)
+            pipe.reset_input_buffer()
+    if not hs_ok:
+        # Last resort: redo the raw handshake entirely and retry once more
+        LOG.debug("Boot screen: retrying full handshake sequence")
+        if _bs_raw_handshake(pipe):
+            pipe.reset_input_buffer()
+            for hs_attempt in range(5):
+                pipe.write(handshake_pkt)
+                try:
+                    _bs_expect(pipe, _BS_CMD_SHAKE, "HANDSHAKE", timeout=1.5)
+                    hs_ok = True
+                    break
+                except errors.RadioError:
+                    LOG.debug("Boot screen HANDSHAKE retry2 attempt %d/5",
+                              hs_attempt + 1)
+                    pipe.reset_input_buffer()
+    if not hs_ok:
+        raise errors.RadioError(
+            "Boot screen upload timed out waiting for radio")
+    status.cur = 2
+    radio.status_fn(status)
+
+    # 3. Erase flash at boot-screen address
+    status.msg = "Boot screen: erasing flash..."
+    radio.status_fn(status)
+    ep = bytearray(6)
+    ep[0] = _BS_FLASH_ADDR & 0xFF
+    ep[1] = (_BS_FLASH_ADDR >> 8) & 0xFF
+    ep[2] = (_BS_FLASH_ADDR >> 16) & 0xFF
+    ep[3] = (_BS_FLASH_ADDR >> 24) & 0xFF
+    ep[4] = 0    # 1 block, MSB
+    ep[5] = 1    # 1 block, LSB
+    pipe.write(_bs_packet(_BS_CMD_ERASE, _BS_ERASE_ID, bytes(ep)))
+    _bs_expect(pipe, _BS_CMD_ERASE, "ERASE", timeout=15.0)
+    status.cur = 3
+    radio.status_fn(status)
+
+    # 4. Set flash write address
+    ap = bytearray(4)
+    ap[0] = _BS_FLASH_ADDR & 0xFF
+    ap[1] = (_BS_FLASH_ADDR >> 8) & 0xFF
+    ap[2] = (_BS_FLASH_ADDR >> 16) & 0xFF
+    ap[3] = (_BS_FLASH_ADDR >> 24) & 0xFF
+    pipe.write(_bs_packet(_BS_CMD_SETADDR, 0, bytes(ap)))
+    _bs_expect(pipe, _BS_CMD_SETADDR, "SET_ADDRESS", timeout=3.0)
+    status.cur = 4
+    radio.status_fn(status)
+
+    # 5. Write image in 1024-byte chunks
+    for pkg_id in range(total):
+        chunk = img_data[pkg_id * _BS_CHUNK:(pkg_id + 1) * _BS_CHUNK]
+        pipe.write(_bs_packet(_BS_CMD_WRITE, pkg_id, chunk))
+        _bs_expect(pipe, _BS_CMD_WRITE, "WRITE chunk %d" % pkg_id, timeout=5.0)
+        status.cur = 5 + pkg_id
+        pct = (pkg_id + 1) * 100 // total
+        status.msg = "Boot screen: writing %d%%" % pct
+        radio.status_fn(status)
+
+    # 6. Signal done
+    pipe.write(_bs_packet(_BS_CMD_OVER, 0, b"Over"))
+    time.sleep(0.5)   # let radio finish before the next serial session
+
+    # Drain any trailing bytes
+    pipe.timeout = 0.1
+    pipe.read(256)
+
+    status.cur = status.max
+    status.msg = "Boot screen uploaded successfully"
+    radio.status_fn(status)
+    LOG.info("Boot screen upload complete: %s", img_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 @directory.register
 class UV17Pro(bfc.BaofengCommonHT):
@@ -1728,6 +2076,59 @@ class BF5RM(UV17Pro):
     LIST_PW_SAVEMODE = ["Off", "1:1", "1:2", "1:4"]
     _has_workmode_support = True
     MODES = UV17Pro.MODES + ['AM']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._boot_image_path = ""
+
+    def get_settings(self):
+        settings = super().get_settings()
+
+        boot = RadioSettingGroup("boot_screen", "Boot Screen")
+
+        val = RadioSettingValueFile(
+            current=self._boot_image_path,
+            wildcard="Image files (*.bmp;*.png;*.jpg;*.jpeg)"
+                     "|*.bmp;*.png;*.jpg;*.jpeg"
+                     "|BMP files (*.bmp)|*.bmp"
+                     "|All files (*.*)|*.*")
+        rs = RadioSetting(
+            "boot_screen_image",
+            "Boot screen image — auto-scaled to 160\u00d7128 on upload"
+            " (.bmp native; .png/.jpg needs Pillow)",
+            val)
+
+        def _apply_boot_image(setting, obj):
+            self._boot_image_path = str(setting.value).strip()
+
+        rs.set_apply_callback(_apply_boot_image, None)
+        boot.append(rs)
+        settings.append(boot)
+        return settings
+
+    def sync_out(self):
+        if self._boot_image_path:
+            if not os.path.isfile(self._boot_image_path):
+                raise errors.RadioError(
+                    "Boot screen image not found: %s" % self._boot_image_path)
+            try:
+                _upload_boot_screen(self, self._boot_image_path)
+                # Brief pause before the normal programming session starts
+                time.sleep(1.5)
+            except errors.RadioError:
+                raise
+            except Exception as e:
+                raise errors.RadioError(
+                    "Boot screen upload failed: %s" % e)
+            finally:
+                # Always drain the serial buffer so stale bytes don't corrupt
+                # the channel-programming session that follows.
+                try:
+                    self.pipe.timeout = 0.1
+                    self.pipe.reset_input_buffer()
+                except Exception:
+                    pass
+        super().sync_out()
 
 
 @directory.register
