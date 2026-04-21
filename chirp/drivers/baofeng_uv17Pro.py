@@ -26,7 +26,14 @@ from chirp.settings import RadioSetting, \
     RadioSettingValueString, RadioSettingValueFile, \
     RadioSettings, RadioSettingGroup
 import struct
-from chirp import errors
+from chirp import checksum, errors
+
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    _PIL_AVAILABLE = False
 
 LOG = logging.getLogger(__name__)
 
@@ -235,17 +242,6 @@ _BS_HEIGHT = 128
 _BS_CHUNK = 1024
 
 
-def _bs_crc16(data, offset, count):
-    """CRC-16/CCITT (poly 0x1021) over data[offset:offset+count]."""
-    crc = 0
-    for i in range(count):
-        crc ^= data[offset + i] << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
-        crc &= 0xFFFF
-    return crc
-
-
 def _bs_packet(cmd, pkg_id, payload):
     """Build a framed boot-screen protocol packet."""
     n = len(payload)
@@ -257,7 +253,7 @@ def _bs_packet(cmd, pkg_id, payload):
     frame[4] = (n >> 8) & 0xFF
     frame[5] = n & 0xFF
     frame[6:6 + n] = payload
-    crc = _bs_crc16(frame, 1, 5 + n)
+    crc = checksum.crc16_xmodem(bytes(frame[1:6 + n]))
     frame[6 + n] = (crc >> 8) & 0xFF
     frame[6 + n + 1] = crc & 0xFF
     return bytes(frame)
@@ -266,30 +262,28 @@ def _bs_packet(cmd, pkg_id, payload):
 def _bs_recv(pipe, timeout=5.0):
     """Read one framed response; returns (cmd_byte, payload) or raises."""
     deadline = time.time() + timeout
-    buf = bytearray()
+    # Scan byte-by-byte for the frame header, then read exact field lengths.
     pipe.timeout = 0.05
     while time.time() < deadline:
-        chunk = pipe.read(256)
-        if chunk:
-            buf.extend(chunk)
-        idx = buf.find(_BS_FRAME_HDR)
-        if idx < 0:
-            buf.clear()
+        b = pipe.read(1)
+        if not b or b[0] != _BS_FRAME_HDR:
             continue
-        if idx:
-            del buf[:idx]
-        if len(buf) < 6:
+        # Header found — read cmd(1) + pkg_id(2) + payload_len(2)
+        pipe.timeout = max(0.1, deadline - time.time())
+        hdr = pipe.read(5)
+        if len(hdr) < 5:
             continue
-        n = (buf[4] << 8) | buf[5]
-        needed = 6 + n + 2
-        if len(buf) < needed:
+        n = (hdr[3] << 8) | hdr[4]
+        # Read payload (n bytes) + CRC (2 bytes)
+        body = pipe.read(n + 2)
+        if len(body) < n + 2:
             continue
-        frame = bytes(buf[:needed])
-        crc_rx = (frame[6 + n] << 8) | frame[6 + n + 1]
-        if crc_rx != _bs_crc16(frame, 1, 5 + n):
-            del buf[:1]
+        frame = bytes([_BS_FRAME_HDR]) + hdr + body
+        crc_rx = (body[n] << 8) | body[n + 1]
+        if crc_rx != checksum.crc16_xmodem(bytes(frame[1:6 + n])):
+            pipe.timeout = 0.05
             continue
-        return frame[1], bytes(frame[6:6 + n])
+        return hdr[0], bytes(body[:n])
     raise errors.RadioError("Boot screen upload timed out waiting for radio")
 
 
@@ -316,9 +310,8 @@ def _bs_read_bmp(path):
     bpp = struct.unpack_from('<H', raw, 28)[0]
     if bpp != 24:
         raise errors.RadioError(
-            "Boot screen: BMP must be 24-bit RGB (got %d-bit). "
-            "Re-save as 24-bit BMP or use PNG/JPEG with "
-            "Pillow installed." % bpp)
+            "Boot screen: unsupported format — BMP must be 24-bit RGB "
+            "(got %d-bit). Re-save as a 24-bit BMP." % bpp)
     flip = height > 0
     height = abs(height)
     row_sz = (width * 3 + 3) & ~3
@@ -378,34 +371,26 @@ def _bs_image_to_rgb565(img_path):
             rows = _bs_scale_nn(rows, w, h, _BS_WIDTH, _BS_HEIGHT)
         data = _bs_rows_to_rgb565(rows)
     else:
-        try:
-            from PIL import Image
-        except ImportError:
-            import subprocess
-            import sys
-            LOG.info("Boot screen: Pillow not found, attempting install...")
-            try:
-                subprocess.check_call(
-                    [sys.executable, '-m', 'pip', 'install', 'Pillow'],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                from PIL import Image
-            except Exception:
-                raise errors.RadioError(
-                    "Boot screen: Pillow is required for non-BMP images. "
-                    "Install it with: pip install Pillow")
-        img = Image.open(img_path).convert('RGB')
+        if not _PIL_AVAILABLE:
+            raise errors.RadioError(
+                "Boot screen: unsupported format — only 24-bit BMP files "
+                "are supported without Pillow. Convert the image to a "
+                "24-bit BMP and try again.")
+        img = _PILImage.open(img_path).convert('RGB')
         if img.width != _BS_WIDTH or img.height != _BS_HEIGHT:
             LOG.info("Boot screen: scaling image from %dx%d to %dx%d",
                      img.width, img.height, _BS_WIDTH, _BS_HEIGHT)
-            img = img.resize((_BS_WIDTH, _BS_HEIGHT), Image.LANCZOS)
+            img = img.resize((_BS_WIDTH, _BS_HEIGHT), _PILImage.LANCZOS)
         pixels = img.load()
+        # Pack each pixel as RGB565 little-endian:
+        # bits 15-11 = R (5 bits), 10-5 = G (6 bits), 4-0 = B (5 bits)
         buf = bytearray(_BS_WIDTH * _BS_HEIGHT * 2)
         for y in range(_BS_HEIGHT):
             for x in range(_BS_WIDTH):
                 r, g, b = pixels[x, y]
                 px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
                 i = (y * _BS_WIDTH + x) * 2
-                buf[i] = px & 0xFF
+                buf[i] = px & 0xFF        # low byte first (little-endian)
                 buf[i + 1] = (px >> 8) & 0xFF
         data = bytes(buf)
 
@@ -446,13 +431,12 @@ def _bs_raw_handshake(pipe):
     return False
 
 
-def _upload_boot_screen(radio, img_path):
+def _upload_boot_screen(radio, img_data):
     """
-    Upload a boot screen image to the radio using the dedicated picture
-    protocol.  Called from BF5RM.sync_out() before the normal channel upload.
-    Uses the already-open radio.pipe serial port.
+    Upload pre-converted RGB565 image data to the radio using the dedicated
+    picture protocol.  Called from BF5RM.sync_out() before the normal channel
+    upload.  Uses the already-open radio.pipe serial port.
     """
-    img_data = _bs_image_to_rgb565(img_path)
     total = len(img_data) // _BS_CHUNK
     pipe = radio.pipe
     pipe.dtr = True
@@ -2080,26 +2064,42 @@ class BF5RM(UV17Pro):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._boot_image_path = ""
+        self._boot_image_data = None  # RGB565 bytes, populated by set_settings()
 
     def get_settings(self):
         settings = super().get_settings()
 
         boot = RadioSettingGroup("boot_screen", "Boot Screen")
 
+        if _PIL_AVAILABLE:
+            wildcard = ("Image files (*.bmp;*.png;*.jpg;*.jpeg)"
+                        "|*.bmp;*.png;*.jpg;*.jpeg"
+                        "|BMP files (*.bmp)|*.bmp"
+                        "|All files (*.*)|*.*")
+            label = ("Boot screen image — auto-scaled to 160\u00d7128"
+                     " on upload (.bmp, .png, .jpg)")
+        else:
+            wildcard = "BMP files (*.bmp)|*.bmp|All files (*.*)|*.*"
+            label = ("Boot screen image — auto-scaled to 160\u00d7128"
+                     " on upload (.bmp only)")
+
         val = RadioSettingValueFile(
             current=self._boot_image_path,
-            wildcard="Image files (*.bmp;*.png;*.jpg;*.jpeg)"
-                     "|*.bmp;*.png;*.jpg;*.jpeg"
-                     "|BMP files (*.bmp)|*.bmp"
-                     "|All files (*.*)|*.*")
-        rs = RadioSetting(
-            "boot_screen_image",
-            "Boot screen image — auto-scaled to 160\u00d7128 on upload"
-            " (.bmp native; .png/.jpg needs Pillow)",
-            val)
+            wildcard=wildcard)
+        rs = RadioSetting("boot_screen_image", label, val)
 
         def _apply_boot_image(setting, obj):
-            self._boot_image_path = str(setting.value).strip()
+            path = str(setting.value).strip()
+            self._boot_image_path = path
+            if path:
+                if not os.path.isfile(path):
+                    raise errors.RadioError(
+                        "Boot screen image not found: %s" % path)
+                # Validate and convert now so the user gets an error
+                # immediately when applying settings, not mid-upload.
+                self._boot_image_data = _bs_image_to_rgb565(path)
+            else:
+                self._boot_image_data = None
 
         rs.set_apply_callback(_apply_boot_image, None)
         boot.append(rs)
@@ -2107,12 +2107,9 @@ class BF5RM(UV17Pro):
         return settings
 
     def sync_out(self):
-        if self._boot_image_path:
-            if not os.path.isfile(self._boot_image_path):
-                raise errors.RadioError(
-                    "Boot screen image not found: %s" % self._boot_image_path)
+        if self._boot_image_data:
             try:
-                _upload_boot_screen(self, self._boot_image_path)
+                _upload_boot_screen(self, self._boot_image_data)
                 # Brief pause before the normal programming session starts
                 time.sleep(1.5)
             except errors.RadioError:
