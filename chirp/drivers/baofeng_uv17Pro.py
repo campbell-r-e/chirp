@@ -545,7 +545,7 @@ def _upload_boot_screen(radio, img_data):
     status.cur = status.max
     status.msg = "Boot screen uploaded successfully"
     radio.status_fn(status)
-    LOG.info("Boot screen upload complete: %s", img_path)
+    LOG.info("Boot screen upload complete (%d bytes)", len(img_data))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2095,8 +2095,7 @@ class BF5RM(UV17Pro):
                 if not os.path.isfile(path):
                     raise errors.RadioError(
                         "Boot screen image not found: %s" % path)
-                # Validate and convert now so the user gets an error
-                # immediately when applying settings, not mid-upload.
+                # Convert here so bad files are caught before upload starts
                 self._boot_image_data = _bs_image_to_rgb565(path)
             else:
                 self._boot_image_data = None

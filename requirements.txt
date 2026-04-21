@@ -13,6 +13,5 @@ pywin32; platform_system=="Windows"
 suds
 yattag
 lark
-# Required for PNG/JPEG boot screen image support (BF5RM and related models).
-# Version constraint left open — maintainer to tighten based on build targets.
+# Needed for PNG/JPEG boot screen support on BF5RM and related models
 Pillow
