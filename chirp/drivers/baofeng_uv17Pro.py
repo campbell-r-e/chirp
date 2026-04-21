@@ -374,8 +374,8 @@ def _bs_image_to_rgb565(img_path):
         if not _PIL_AVAILABLE:
             raise errors.RadioError(
                 "Boot screen: unsupported format — only 24-bit BMP files "
-                "are supported without Pillow. Convert the image to a "
-                "24-bit BMP and try again.")
+                "are supported. Convert the image to a 24-bit BMP and "
+                "try again.")
         img = _PILImage.open(img_path).convert('RGB')
         if img.width != _BS_WIDTH or img.height != _BS_HEIGHT:
             LOG.info("Boot screen: scaling image from %dx%d to %dx%d",
