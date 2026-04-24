@@ -50,7 +50,10 @@ LOG = logging.getLogger(__name__)
 BAUD_PRIMARY = 19200
 BAUD_FALLBACK = 115200
 
-_T_INFO = b'\x00' * 12 + b'\xFF' * 4   # 16-byte wake pulse
+# Wake pulse: 12 null bytes flush any pending serial state; the trailing
+# four 0xFF bytes are the "start of session" sentinel the radio expects.
+# The radio always replies to this with a raw (non-XOR'd) 0x41 ACK byte.
+_T_INFO = b'\x00' * 12 + b'\xFF' * 4
 _MAGIC_PROGRAM = b'PROGRAM'
 _MAGIC_INFO = b'INFORMATION'
 _MAGIC_END = b'END\x00'
@@ -109,14 +112,14 @@ _BS_CHUNK = 4096   # raw block size for boot screen upload
 LIST_WORKMODE = ['Frequency', 'Channel']
 LIST_BANDWIDTH = ['Wide', 'Narrow']
 LIST_POWER = ['High', 'Mid', 'Low']
-LIST_VOICE = ['Off', 'English', 'Chinese']
+LIST_VOICE = ['Off', 'Chinese', 'English']
 LIST_SQUELCH = [str(x) for x in range(0, 10)]
-LIST_APO = ['Off'] + ['%d min' % x for x in range(1, 61)]
-LIST_TOT = ['Off'] + ['%d s' % x for x in range(15, 615, 15)]
-LIST_BACKLIGHT = ['Off', '5 s', '10 s', '20 s', '30 s', 'Always On']
+LIST_APO = ['Off', '30 min', '60 min', '120 min', '240 min', '480 min']
+LIST_TOT = ['Off'] + ['%d s' % x for x in range(15, 225, 15)]
+LIST_BACKLIGHT = ['Always On'] + ['%d s' % x for x in range(5, 31)]
 LIST_BLIGHT_LV = [str(x) for x in range(1, 6)]
 LIST_GPS_MODE = ['GPS', 'Beidou', 'GPS+Beidou']
-LIST_DISP_MODE = ['Frequency', 'Channel Number', 'Name']
+LIST_DISP_MODE = ['Frequency', 'Name', 'Channel Number', 'Freq+Name']
 LIST_SCAN_MODE = ['Time', 'Carrier', 'Search']
 LIST_PTTID = ['Off', 'BOT', 'EOT', 'Both']
 LIST_DUPLEX = ['Off', '+', '-']
@@ -124,20 +127,35 @@ LIST_OFFSETDIR = ['Off', '+', '-', 'Split']
 LIST_SQTYPE = ['Off', 'CTCSS', 'DCS', 'CTCSS/DCS']
 LIST_SIGNAL = ['Off', 'DTMF', '2-Tone', '5-Tone', 'MDC-1200']
 LIST_BCL = ['Off', 'Carrier', 'Tone']
-LIST_BT_PAIR = ['Off', 'Always', 'PTT']
-LIST_END_TONE = ['Off', 'Tone', 'DTMF']
-LIST_TAIL_FREQ = ['Off', '55 Hz', '62.5 Hz', '1750 Hz', '2100 Hz',
-                  '2450 Hz', '2950 Hz']
+LIST_END_TONE = ['Off', 'Mode 1', 'Mode 2', 'Mode 3']
+LIST_TAIL_FREQ = ['Off', '55 Hz', '120°', '180°', '240°']
 LIST_MAIN_BAND = ['A', 'B']
-LIST_POWON_FACE = ['Default', 'Picture', 'User Name']
+LIST_POWON_FACE = ['Picture', 'Name', 'Battery']
 LIST_RTNCH = ['Last', 'Priority', 'Original']
+# Byte values must match ProKeyEnum exactly (0-16)
 LIST_KEY_FUNC = [
-    'None', 'Monitor', 'Display', 'Scan', 'Alarm', 'FM Radio', 'NOAA',
-    'TX Power', 'Bandwidth', 'Talk Around', 'Reverse', 'DTMF', 'Zone+',
-    'Zone-', 'GPS', 'Bluetooth', 'Compander', 'Noise Cancel',
-    'Fallen Detect', 'Flight Mode', 'Record',
+    'None',             # 0
+    'Scan On/Off',      # 1
+    'Monitor',          # 2
+    'Flashlight',       # 3
+    'FM Radio',         # 4
+    'Emergency',        # 5
+    'GPS',              # 6
+    'Freq. Measuring',  # 7
+    'Bluetooth',        # 8
+    '1750 Hz',          # 9
+    'Freq. Inversion',  # 10
+    'Lone Worker',      # 11
+    'Fallen Alarm',     # 12
+    'One Touch Call',   # 13
 ]
 LIST_LONEWORK_RSP = ['None', 'Alarm', 'TX Alarm', 'Message']
+LIST_POSAVE = ['Off', '1:1', '1:2', '1:4']
+LIST_POSAVE_DLY = ['5 s', '10 s', '15 s', '20 s', '25 s']
+LIST_VOX_DLY = ['%.1f s' % (1.0 + i * 0.5) for i in range(19)]
+LIST_HZ1750 = ['1000 Hz', '1450 Hz', '1750 Hz', '2100 Hz']
+LIST_NOAA_CH = ['WX%d' % i for i in range(1, 11)]
+LIST_RECORD_MODE = ['RX', 'TX', 'All']
 LIST_EMERG_MODE = ['Off', 'TX Alarm', 'TX Code', 'Call & Alarm']
 LIST_EMERG_TYPE = ['Continuous', 'Time', 'Alarm Only']
 LIST_APRS_POWER = ['Low', 'Mid', 'High']
@@ -165,6 +183,9 @@ DTMF_CHARS = '0123456789ABCD*#'
 
 
 def _decode_tone(datH, datL):
+    # Wire format: datH bit7 set → DCS (bit6 set = inverted polarity,
+    # bits[10:8] in datH bits[2:0], code digits in datL).
+    # datH bit7 clear → CTCSS stored as BCD-over-hex: 0x0885 = 88.5 Hz.
     if datH == 0x00 or datH == 0xFF:
         return '', 0, 'N'
     if datH & 0x80:
@@ -174,12 +195,13 @@ def _decode_tone(datH, datL):
         return 'DTCS', code, pol
     else:
         raw = (datH << 8) | datL
-        bcd_decimal = int('%x' % raw)
+        bcd_decimal = int('%x' % raw)   # treat hex digits as decimal
         tone_hz = bcd_decimal / 10.0
         return 'Tone', tone_hz, 'N'
 
 
 def _encode_tone(mode, tone, pol):
+    # Inverse of _decode_tone — CTCSS as BCD-over-hex, DCS with bit flags.
     if mode == '' or mode is None:
         return 0x00, 0x00
     if mode == 'Tone':
@@ -235,9 +257,9 @@ def _decode_name(raw16):
             break
         result.append(b)
     try:
-        return result.decode('gb2312').strip()
+        return result.decode('gb2312').rstrip()
     except UnicodeDecodeError:
-        return result.decode('latin-1', errors='replace').strip()
+        return result.decode('latin-1', errors='replace').rstrip()
 
 
 def _encode_name(text, maxbytes=16):
@@ -408,6 +430,9 @@ def _upload_boot_screen_5rh(radio, img_data):
         b = pipe.read(1)
         if not b or b[0] not in _BS_WAKE_ACKS:
             raise errors.RadioError('Boot screen: no ACK after wake pulse')
+    # Drain any trailing bytes after the wake ACK (same firmware quirk as main clone)
+    pipe.timeout = 0.05
+    pipe.read(16)
 
     # Step 2: send "Picture\xFF" magic
     pipe.write(_MAGIC_PICTURE)
@@ -447,6 +472,10 @@ def _upload_boot_screen_5rh(radio, img_data):
 
 
 # ── Serial I/O helpers ──────────────────────────────────────────────────
+# After the wake pulse, every byte on the wire is XOR'd with a per-session
+# seed (1-254).  _xwrite applies the XOR before sending.  _xread returns
+# the raw (still-XOR'd) bytes; callers XOR them individually, or the full
+# image is bulk-XOR'd after download (see _download_5rh).
 
 def _xwrite(pipe, data, seed):
     pipe.write(bytes(b ^ seed for b in data))
@@ -467,16 +496,25 @@ def _xread(pipe, n, timeout=2.0):
 
 def _wait_ack(pipe, seed, label, timeout=2.0):
     b = _xread(pipe, 1, timeout)
-    decoded = b[0] ^ seed
+    decoded = b[0] ^ seed   # 0x41 ('A') when XOR'd back is a valid ACK
     if decoded != _ACK:
+        LOG.debug('%s: raw=0x%02x seed=0x%02x decoded=0x%02x (expected 0x%02x^seed=0x%02x)',
+                  label, b[0], seed, decoded, _ACK, _ACK ^ seed)
         raise errors.RadioError(
             '%s: expected ACK 0x41, got 0x%02x (raw 0x%02x)' %
             (label, decoded, b[0]))
 
 
 # ── Handshake ───────────────────────────────────────────────────────────
+# Six-step handshake (all bytes after the wake pulse are XOR'd with seed):
+#   1. T_INFO wake pulse  → raw 0x41
+#   2. PROGRAM header (7 XOR'd bytes + plaintext seed at byte 7)  → ACK
+#   3. 8-byte password placeholder (0xFF × 8 XOR'd)  → ACK
+#   4. INFORMATION magic  → 16-byte XOR'd model string
+#   5. Direction byte ('R' or 'W' XOR'd)  → ACK
 
 def _do_handshake(pipe, seed, direction='R'):
+    # Step 1: wake pulse — ACK here is always raw 0x41 (seed not yet in use)
     pipe.write(_T_INFO)
     pipe.timeout = 0.3
     ack = pipe.read(1)
@@ -488,18 +526,27 @@ def _do_handshake(pipe, seed, direction='R'):
         ack = pipe.read(1)
         if not ack or ack[0] != 0x41:
             raise errors.RadioNoResponse()
+    # Some firmware versions send extra bytes after the 0x41 wake ACK
+    # (e.g. a status or version byte).  Drain them so they don't pollute
+    # the PROGRAM ACK read below.
+    pipe.timeout = 0.05
+    pipe.read(16)
     pipe.timeout = 2.0
 
+    # Step 2: PROGRAM header — "PROGRAM" XOR'd, then seed byte at index 7
+    # (plaintext) so the radio learns the session key for all subsequent I/O.
     hdr = bytearray(8)
     for i, c in enumerate(_MAGIC_PROGRAM):
         hdr[i] = seed ^ c
-    hdr[7] = seed
+    hdr[7] = seed   # session key embedded here; radio uses it from now on
     pipe.write(bytes(hdr))
     _wait_ack(pipe, seed, 'PROGRAM ACK')
 
+    # Step 3: password placeholder — radio ignores content; 0xFF × 8 is fine
     _xwrite(pipe, b'\xFF' * 8, seed)
     _wait_ack(pipe, seed, 'Password ACK')
 
+    # Step 4: request model ID — radio replies with 16 XOR'd bytes
     _xwrite(pipe, _MAGIC_INFO, seed)
     raw16 = _xread(pipe, 16)
     model_bytes = bytes(b ^ seed for b in raw16)
@@ -507,6 +554,7 @@ def _do_handshake(pipe, seed, direction='R'):
         'ascii', errors='replace')
     LOG.info('5RH PRO model: %r', model_str)
 
+    # Step 5: tell radio read or write; handshake complete after its ACK
     pipe.write(bytes([seed ^ ord(direction)]))
     _wait_ack(pipe, seed, 'Direction ACK')
     return model_bytes
@@ -521,6 +569,9 @@ def _download_5rh(radio):
     seed = random.randint(1, 254)
     LOG.debug('5RH download seed: 0x%02x', seed)
     _do_handshake(pipe, seed, 'R')
+    # 4096-byte blocks take ~2.14 s at 19200 baud.  Raise pipe.timeout so a
+    # single pipe.read() call can collect the full block without splitting.
+    pipe.timeout = 3.0
 
     buf = bytearray(_MEM_SIZE)
     rx_cnt = 0
@@ -529,16 +580,19 @@ def _download_5rh(radio):
     status.msg = 'Cloning from radio...'
 
     while rx_cnt < _MEM_SIZE:
+        # Read request: 0x52 + addr_hi + addr_lo + 0x00, all XOR'd.
+        # Radio replies with a 4-byte echo header then 4096 XOR'd data bytes.
         req = bytes([0x52, (rx_cnt >> 8) & 0xFF, rx_cnt & 0xFF, 0x00])
         _xwrite(pipe, req, seed)
-        response = _xread(pipe, _BLOCK_SIZE + 4, timeout=5.0)
-        buf[rx_cnt:rx_cnt + _BLOCK_SIZE] = response[4:]
+        response = _xread(pipe, _BLOCK_SIZE + 4, timeout=8.0)
+        buf[rx_cnt:rx_cnt + _BLOCK_SIZE] = response[4:]   # discard header
         rx_cnt += _BLOCK_SIZE
         status.cur = rx_cnt // _BLOCK_SIZE
         radio.status_fn(status)
 
     _xwrite(pipe, _MAGIC_END, seed)
     _wait_ack(pipe, seed, 'END ACK', timeout=3.0)
+    # Data bytes were stored as received (XOR'd); bulk-decode in one pass now.
     for i in range(_MEM_SIZE):
         buf[i] ^= seed
     return bytes(buf)
@@ -551,6 +605,10 @@ def _upload_5rh(radio):
     seed = random.randint(1, 254)
     LOG.debug('5RH upload seed: 0x%02x', seed)
     _do_handshake(pipe, seed, 'W')
+    # Writing a 4096-byte block takes ~2.14 s at 19200 baud; the radio can't
+    # ACK until it has received the entire block.  Raise pipe.timeout so the
+    # ACK read doesn't time out during the block transmission window.
+    pipe.timeout = 3.0
 
     data = radio.get_mmap()
     status = chirp_common.Status()
@@ -559,11 +617,13 @@ def _upload_5rh(radio):
 
     tx_cnt = 0
     while tx_cnt < _MEM_SIZE:
+        # Write packet: 0x57 + addr_hi + addr_lo + 0x00 + 4096 data bytes,
+        # entire packet XOR'd with seed in one pass before sending.
         block = bytes(data[tx_cnt:tx_cnt + _BLOCK_SIZE])
         hdr = bytes([0x57, (tx_cnt >> 8) & 0xFF, tx_cnt & 0xFF, 0x00])
         enc = bytes(b ^ seed for b in hdr + block)
         pipe.write(enc)
-        _wait_ack(pipe, seed, 'Write 0x%04x' % tx_cnt, timeout=5.0)
+        _wait_ack(pipe, seed, 'Write 0x%04x' % tx_cnt, timeout=8.0)
         tx_cnt += _BLOCK_SIZE
         status.cur = tx_cnt // _BLOCK_SIZE
         radio.status_fn(status)
@@ -631,18 +691,21 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
     MEM_SIZE = _MEM_SIZE
 
     POWER_LEVELS = [
-        chirp_common.PowerLevel('High', watts=5),
-        chirp_common.PowerLevel('Mid', watts=2),
-        chirp_common.PowerLevel('Low', watts=0.5),
+        chirp_common.PowerLevel('High', watts=10),
+        chirp_common.PowerLevel('Mid', watts=5),
+        chirp_common.PowerLevel('Low', watts=1),
     ]
 
-    MODES = ['FM', 'NFM', 'AM']
+    MODES = ['FM', 'NFM']
 
+    # TX: 136-174, 220-260, 400-480 MHz
+    # RX adds: 108-136 MHz airband AM, 350-390 MHz, and UHF up to 520 MHz
     VALID_BANDS = [
-        (108_000_000, 136_000_000),
-        (136_000_000, 174_000_000),
-        (200_000_000, 260_000_000),
-        (400_000_000, 480_000_000),
+        (108_000_000, 136_000_000),  # Airband AM (RX only)
+        (136_000_000, 174_000_000),  # VHF
+        (220_000_000, 260_000_000),  # 220 MHz
+        (350_000_000, 390_000_000),  # UHF low (RX only)
+        (400_000_000, 520_000_000),  # UHF (TX 400-480, RX to 520)
     ]
 
     DTCS_CODES = sorted(chirp_common.DTCS_CODES)
@@ -762,26 +825,28 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
 
         # Frequencies
         mem.freq = _decode_freq(raw[0:4])
-        tx_freq = _decode_freq(raw[4:8])
+        tx_raw = raw[4:8]
 
-        if all(b == 0xFF for b in raw[4:8]):
+        if all(b == 0xFF for b in tx_raw):
             mem.duplex = 'off'
             mem.offset = 0
-        elif tx_freq == mem.freq:
-            mem.duplex = ''
-            mem.offset = 0
         else:
-            diff = tx_freq - mem.freq
-            if chirp_common.is_split(self.get_features().valid_bands,
-                                     mem.freq, tx_freq):
-                mem.duplex = 'split'
-                mem.offset = tx_freq
-            elif diff > 0:
-                mem.duplex = '+'
-                mem.offset = diff
+            tx_freq = _decode_freq(tx_raw)
+            if tx_freq == mem.freq:
+                mem.duplex = ''
+                mem.offset = 0
             else:
-                mem.duplex = '-'
-                mem.offset = abs(diff)
+                diff = tx_freq - mem.freq
+                if chirp_common.is_split(self.get_features().valid_bands,
+                                         mem.freq, tx_freq):
+                    mem.duplex = 'split'
+                    mem.offset = tx_freq
+                elif diff > 0:
+                    mem.duplex = '+'
+                    mem.offset = diff
+                else:
+                    mem.duplex = '-'
+                    mem.offset = abs(diff)
 
         # Tones
         tx_mode, tx_val, tx_pol = _decode_tone(raw[10], raw[11])
@@ -796,15 +861,15 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         mem.power = self.POWER_LEVELS[min(power_idx, 2)]
         is_narrow = bool((f16 >> 4) & 0x03)
         mem.mode = 'NFM' if is_narrow else 'FM'
-        if chirp_common.in_range(mem.freq, [(108_000_000, 136_000_000)]):
-            mem.mode = 'AM'
 
         # Skip flag
         scan_val = _mb(self._mmap, ADDR_SCAN_FLAGS + idx // 8)
         mem.skip = '' if ((scan_val >> (idx % 8)) & 1) == 0 else 'S'
 
-        # Name
-        mem.name = _decode_name(raw[32:48])
+        # Name — field is 16 bytes to accommodate GB2312 (2 bytes/char), but
+        # the radio displays at most LENGTH_NAME (8) characters.  Clamp so
+        # any stray non-null bytes beyond the real name stay invisible.
+        mem.name = _decode_name(raw[32:48])[:self.LENGTH_NAME]
 
         # Extra settings
         mem.extra = RadioSettingGroup('Extra', 'extra')
@@ -827,6 +892,12 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueBoolean(bool((f20 >> 5) & 1)))
         _exa('scram', 'Scramble',
              RadioSettingValueBoolean(bool((f20 >> 4) & 1)))
+        _exa('cepin24bit', 'Freq. Measuring 24-bit',
+             RadioSettingValueBoolean(bool((f20 >> 7) & 1)))
+        _exa('cepindcs', 'Freq. Measuring DCS',
+             RadioSettingValueBoolean(bool((f20 >> 6) & 1)))
+        _exa('freqinvert', 'Frequency Inversion',
+             RadioSettingValueBoolean(bool((f16 >> 1) & 1)))
         _exa('signaltype', 'Signal Type',
              RadioSettingValueList(LIST_SIGNAL,
                                    current_index=min((f18 >> 5) & 0x07, 4)))
@@ -908,10 +979,16 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
                     f19 |= (0x20 if bool(v) else 0)
                 elif nm == 'talkaround':
                     f16 |= (1 if bool(v) else 0)
+                elif nm == 'freqinvert':
+                    f16 |= (0x02 if bool(v) else 0)
                 elif nm == 'compand':
                     f20 |= (0x20 if bool(v) else 0)
                 elif nm == 'scram':
                     f20 |= (0x10 if bool(v) else 0)
+                elif nm == 'cepin24bit':
+                    f20 |= (0x80 if bool(v) else 0)
+                elif nm == 'cepindcs':
+                    f20 |= (0x40 if bool(v) else 0)
                 elif nm == 'signaltype':
                     f18 |= (int(v) & 0x07) << 5
                 elif nm == 'sqtype':
@@ -943,8 +1020,9 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         raw[19] = f19
         raw[20] = f20
 
-        # Name
-        enc_name = _encode_name(mem.name, 16)
+        # Name — truncate to LENGTH_NAME chars before encoding so we never
+        # store more than the radio can display, regardless of what the UI passed.
+        enc_name = _encode_name(mem.name[:self.LENGTH_NAME], 16)
         raw[32:48] = enc_name
 
         _write_chn_raw(mmap, idx, bytes(raw))
@@ -975,6 +1053,16 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
     def get_settings(self):
         s = [self._s(i) for i in range(128)]
 
+        # Pre-read zone names so they can be used in selectors elsewhere
+        _zone_labels = []
+        for _zi in range(10):
+            _zbase = ADDR_ZONES + _zi * 152
+            _zraw = _mread(self._mmap, _zbase + 136, 16)
+            _zname = _decode_name(_zraw).strip()
+            _zone_labels.append(
+                'Zone %d: %s' % (_zi + 1, _zname) if _zname
+                else 'Zone %d' % (_zi + 1))
+
         basic = RadioSettingGroup('basic', 'Basic Settings')
         display = RadioSettingGroup('display', 'Display')
         keys = RadioSettingGroup('keys', 'Key Assignments')
@@ -990,12 +1078,11 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         aprs = RadioSettingGroup('aprs', 'APRS')
         gps = RadioSettingGroup('gps', 'GPS')
         gps_book = RadioSettingGroup('gps_book', 'GPS Book')
-        bt = RadioSettingGroup('bt', 'Bluetooth')
         boot = RadioSettingGroup('boot', 'Boot Screen')
 
         top = RadioSettings(basic, display, keys, vfo_a, vfo_b, zones, scan,
                             dtmf, twotone, fivetone, mdc, emerg, aprs,
-                            gps, gps_book, bt, boot)
+                            gps, gps_book, boot)
 
         def _add(group, path, label, val_obj):
             group.append(RadioSetting(path, label, val_obj))
@@ -1015,16 +1102,16 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueInteger(
                  1, _MAX_CHN, max(1, min(chb_num, _MAX_CHN))))
 
-        _add(basic, 'settings.chazone', 'Channel A Zone',
-             RadioSettingValueInteger(0, 9, min(s[6], 9)))
-        _add(basic, 'settings.chbzone', 'Channel B Zone',
-             RadioSettingValueInteger(0, 9, min(s[7], 9)))
+        _add(basic, 'settings.chazone', 'Channel A Active Zone',
+             RadioSettingValueList(_zone_labels,
+                                   current_index=min(s[6], 9)))
+        _add(basic, 'settings.chbzone', 'Channel B Active Zone',
+             RadioSettingValueList(_zone_labels,
+                                   current_index=min(s[7], 9)))
 
-        bl_raw = s[8]
-        bl_idx = max(0, min(bl_raw - 4, len(LIST_BACKLIGHT) - 1)
-                     ) if bl_raw >= 4 else 0
         _add(basic, 'settings.backlight', 'Backlight Time',
-             RadioSettingValueList(LIST_BACKLIGHT, current_index=bl_idx))
+             RadioSettingValueList(LIST_BACKLIGHT,
+                                   current_index=min(s[8], 26)))
         _add(basic, 'settings.blightlv', 'Backlight Level',
              RadioSettingValueList(LIST_BLIGHT_LV,
                                    current_index=max(0, min(s[9] - 1, 4))))
@@ -1041,6 +1128,16 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         _add(basic, 'settings.voxlv', 'VOX Level (0=off)',
              RadioSettingValueInteger(0, 9, max(0, min(vox_raw - 1, 9))))
 
+        voxdly_idx = max(0, min((s[15] - 10) // 5, len(LIST_VOX_DLY) - 1))
+        _add(basic, 'settings.voxdettime', 'VOX Delay',
+             RadioSettingValueList(LIST_VOX_DLY, current_index=voxdly_idx))
+
+        _add(basic, 'settings.posave', 'Power Save',
+             RadioSettingValueList(LIST_POSAVE, current_index=min(s[16], 3)))
+        _add(basic, 'settings.posavedly', 'Power Save Delay',
+             RadioSettingValueList(LIST_POSAVE_DLY,
+                                   current_index=min(s[17], 4)))
+
         apo_idx = min(s[20], len(LIST_APO) - 1)
         _add(basic, 'settings.apo', 'Auto Power Off',
              RadioSettingValueList(LIST_APO, current_index=apo_idx))
@@ -1050,7 +1147,13 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueList(LIST_TOT, current_index=tot_idx))
 
         _add(basic, 'settings.pretot', 'Pre-TX Alarm (s)',
-             RadioSettingValueInteger(0, 60, s[22]))
+             RadioSettingValueInteger(0, 10, min(s[22], 10)))
+
+        _add(basic, 'settings.hz1750', '1750 Hz Tone Freq',
+             RadioSettingValueList(LIST_HZ1750, current_index=min(s[26], 3)))
+
+        _add(basic, 'settings.noaach', 'NOAA Channel',
+             RadioSettingValueList(LIST_NOAA_CH, current_index=min(s[30], 9)))
 
         _add(basic, 'settings.loneworktim', 'Lone Worker Timer (min)',
              RadioSettingValueInteger(0, 99, s[18]))
@@ -1085,11 +1188,18 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueBoolean(bool((b34 >> 7) & 1)))
         _add(basic, 'settings.endtone', 'End Tone',
              RadioSettingValueList(LIST_END_TONE,
-                                   current_index=min((b34 >> 5) & 0x03, 2)))
+                                   current_index=min((b34 >> 5) & 0x03, 3)))
 
         b37 = s[37]
+        _add(basic, 'settings.reord', 'Record Enable',
+             RadioSettingValueBoolean(bool((b37 >> 7) & 1)))
+        _add(basic, 'settings.recordmode', 'Record Mode',
+             RadioSettingValueList(LIST_RECORD_MODE,
+                                   current_index=min((b37 >> 5) & 0x03, 2)))
+        _add(basic, 'settings.tianqi', 'Weather Alarm',
+             RadioSettingValueBoolean(bool((b37 >> 3) & 1)))
         _add(basic, 'settings.langsel', 'Language',
-             RadioSettingValueList(['Chinese', 'English'],
+             RadioSettingValueList(['English', 'Chinese'],
                                    current_index=(b37 >> 2) & 1))
         _add(basic, 'settings.pownface', 'Power-On Screen',
              RadioSettingValueList(LIST_POWON_FACE,
@@ -1098,7 +1208,7 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         b38 = s[38]
         _add(basic, 'settings.tailfreq', 'Tail Tone Freq',
              RadioSettingValueList(LIST_TAIL_FREQ,
-                                   current_index=min((b38 >> 5) & 0x07, 6)))
+                                   current_index=min((b38 >> 5) & 0x07, 4)))
         _add(basic, 'settings.noaa', 'NOAA Weather',
              RadioSettingValueBoolean(bool((b38 >> 4) & 1)))
         _add(basic, 'settings.dispdir', 'Call Direction Display',
@@ -1137,10 +1247,10 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         b10 = s[10]
         _add(display, 'settings.chadispmode', 'Channel A Display Mode',
              RadioSettingValueList(LIST_DISP_MODE,
-                                   current_index=min((b10 >> 4) & 0x0F, 2)))
+                                   current_index=min((b10 >> 4) & 0x0F, 3)))
         _add(display, 'settings.chbdispmode', 'Channel B Display Mode',
              RadioSettingValueList(LIST_DISP_MODE,
-                                   current_index=min(b10 & 0x0F, 2)))
+                                   current_index=min(b10 & 0x0F, 3)))
 
         # ── Key Assignments ──────────────────────────────────────────────────
         key_names = [
@@ -1185,23 +1295,46 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
                  RadioSettingValueString(0, 8, zname, False, _CHARSET))
             chn_str = ','.join(chn_ids)
             _add(zones, 'zones.zone%d_chns' % zi,
-                 'Zone %d Channels (comma-separated)' % (zi + 1),
+                 'Zone %d Channels — up to 64, enter comma-sep IDs' % (zi + 1),
                  RadioSettingValueString(0, 200, chn_str, False,
                                          chirp_common.CHARSET_ASCII + ','))
+            # Read-only preview: show channel names for the first 12 entries
+            _preview_parts = []
+            for _cid_str in chn_ids[:12]:
+                try:
+                    _cid = int(_cid_str)
+                    if _chn_used(self._mmap, _cid - 1):
+                        _craw = _read_chn_raw(self._mmap, _cid - 1)
+                        _cname = _decode_name(_craw[32:48]).strip()
+                        _preview_parts.append(
+                            '%d:%s' % (_cid, _cname) if _cname
+                            else _cid_str)
+                    else:
+                        _preview_parts.append(_cid_str)
+                except Exception:
+                    _preview_parts.append(_cid_str)
+            if len(chn_ids) > 12:
+                _preview_parts.append('+%d more' % (len(chn_ids) - 12))
+            _preview = (', '.join(_preview_parts)
+                        if _preview_parts else '(empty)')
+            _add(zones, 'zones.zone%d_preview' % zi,
+                 'Zone %d Contents (read-only)' % (zi + 1),
+                 RadioSettingValueString(0, 200, _preview, False,
+                                         chirp_common.CHARSET_ASCII + ',:+'))
 
         # ── Scan ─────────────────────────────────────────────────────────────
         for si in range(10):
             base = ADDR_SCAN_FREQ + si * 8
             up_raw = _mread(self._mmap, base, 4)
             dw_raw = _mread(self._mmap, base + 4, 4)
-            up_hz = _decode_freq_le(up_raw)
-            dw_hz = _decode_freq_le(dw_raw)
+            up_hz = min(520_000_000, _decode_freq_le(up_raw))
+            dw_hz = min(520_000_000, _decode_freq_le(dw_raw))
             _add(scan, 'scan.freq%d_up' % si,
                  'Scan %d Up Freq (Hz)' % (si + 1),
-                 RadioSettingValueInteger(0, 480_000_000, up_hz))
+                 RadioSettingValueInteger(0, 520_000_000, up_hz))
             _add(scan, 'scan.freq%d_dw' % si,
                  'Scan %d Down Freq (Hz)' % (si + 1),
-                 RadioSettingValueInteger(0, 480_000_000, dw_hz))
+                 RadioSettingValueInteger(0, 520_000_000, dw_hz))
 
         sp = _mread(self._mmap, ADDR_SCAN_PARA, 9)
         _add(scan, 'scan.scanmode', 'Scan Mode',
@@ -1414,7 +1547,7 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         for mi in range(100):
             base = ADDR_MDC_DEC + mi * 16
             mp = _mread(self._mmap, base, 16)
-            dec_id = (mp[0] << 8) | mp[1]
+            dec_id = min(9999, (mp[0] << 8) | mp[1])
             mname = _decode_name(bytes(mp[4:16]))
             en_byte = mi // 8
             en_bit = mi % 8
@@ -1446,6 +1579,12 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             _add(emerg, 'emerg.%d_txtime' % ei,
                  'Emerg %d TX Time' % (ei + 1),
                  RadioSettingValueInteger(0, 255, ep[3]))
+            _add(emerg, 'emerg.%d_exgtime' % ei,
+                 'Emerg %d Exchange Time' % (ei + 1),
+                 RadioSettingValueInteger(0, 255, ep[4]))
+            _add(emerg, 'emerg.%d_grpno' % ei,
+                 'Emerg %d Group Number' % (ei + 1),
+                 RadioSettingValueInteger(0, 255, ep[5]))
             _add(emerg, 'emerg.%d_mode' % ei,
                  'Emerg %d Mode' % (ei + 1),
                  RadioSettingValueList(LIST_EMERG_MODE,
@@ -1518,6 +1657,12 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueInteger(0, 255, ap[16]))
         _add(aprs, 'aprs.codedly', 'Code Delay',
              RadioSettingValueInteger(0, 255, ap[17]))
+        ctdcs_mode, ctdcs_val, ctdcs_pol = _decode_tone(ap[18], ap[19])
+        _add(aprs, 'aprs.ctdcs', 'RX CTCSS/DCS Filter (Off / Hz / DXXXN)',
+             RadioSettingValueString(0, 10,
+                                     self._tone_to_str(ctdcs_mode, ctdcs_val,
+                                                       ctdcs_pol),
+                                     False, chirp_common.CHARSET_ASCII))
 
         b92 = ap[92]
         _add(aprs, 'aprs.beacon', 'Beacon',
@@ -1543,11 +1688,11 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         txtlen = min(ap[95], 60)
         _add(aprs, 'aprs.txtlength', 'Text Length',
              RadioSettingValueInteger(0, 60, txtlen))
-        try:
-            aprs_txt = bytes(ap[108:108 + txtlen]
-                             ).decode('utf-8', errors='replace')
-        except Exception:
-            aprs_txt = ''
+        _valid_aprs = set(chirp_common.CHARSET_ASCII + ' .,!?-+/')
+        aprs_txt = ''.join(
+            c for c in bytes(ap[108:108 + txtlen]).decode(
+                'ascii', errors='replace')
+            if c in _valid_aprs)
         _add(aprs, 'aprs.txt', 'APRS Text (max 60)',
              RadioSettingValueString(0, 60, aprs_txt[:60], False,
                                      chirp_common.CHARSET_ASCII + ' .,!?-+/'))
@@ -1587,13 +1732,37 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
                  'TX Callsign %d SSID' % (ai + 1),
                  RadioSettingValueInteger(0, 15, cs_id))
 
+        # 32 RX callsigns at ap[200 + i*8]:
+        # 6-byte callsign, 1-byte SSID, 1-byte filter flag
+        rxcs_count = min(ap[22], 32)
+        _add(aprs, 'aprs.rxcscount', 'RX Callsign Count',
+             RadioSettingValueInteger(0, 32, rxcs_count))
+        for ai in range(32):
+            base_r = 200 + ai * 8
+            rcs = bytes(ap[base_r:base_r + 6]).rstrip(
+                b'\xFF\x00\x20').decode('ascii', errors='replace')
+            rcs_id = min(ap[base_r + 6], 15) if ap[base_r + 6] <= 15 else 0
+            rcs_filt = bool(ap[base_r + 7])
+            _add(aprs, 'aprs.rxcs%d' % ai,
+                 'RX Callsign %d' % (ai + 1),
+                 RadioSettingValueString(0, 6, rcs[:6], False,
+                                         chirp_common.CHARSET_ASCII))
+            _add(aprs, 'aprs.rxcsid%d' % ai,
+                 'RX Callsign %d SSID' % (ai + 1),
+                 RadioSettingValueInteger(0, 15, rcs_id))
+            _add(aprs, 'aprs.rxcsfilt%d' % ai,
+                 'RX Callsign %d Filter' % (ai + 1),
+                 RadioSettingValueBoolean(rcs_filt))
+
         # 8 APRS TX frequencies (at offset 168 within ap[])
         for ai in range(8):
             freq_raw = bytes(ap[168 + ai * 4:172 + ai * 4])
             freq_hz = _decode_freq_le(freq_raw)
+            freq_mhz = '%.4f' % (freq_hz / 1_000_000)
             _add(aprs, 'aprs.txfreq%d' % ai,
-                 'APRS TX Freq %d (Hz)' % (ai + 1),
-                 RadioSettingValueInteger(0, 480_000_000, freq_hz))
+                 'APRS TX Freq %d (MHz)' % (ai + 1),
+                 RadioSettingValueString(0, 10, freq_mhz, False,
+                                         '0123456789.'))
 
         # ── GPS ──────────────────────────────────────────────────────────────
         b35 = s[35]
@@ -1626,34 +1795,6 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             _add(gps_book, 'gps_book.%d_name' % gi,
                  'GPS Book %d Name' % (gi + 1),
                  RadioSettingValueString(0, 7, gname[:7], False, _CHARSET))
-
-        # ── Bluetooth ────────────────────────────────────────────────────────
-        b36 = s[36]
-        _add(bt, 'settings.bluetooth', 'Bluetooth On',
-             RadioSettingValueBoolean(bool((b36 >> 7) & 1)))
-        _add(bt, 'settings.btpair', 'BT Pair Mode',
-             RadioSettingValueList(LIST_BT_PAIR,
-                                   current_index=min((b36 >> 5) & 0x03, 2)))
-        _add(bt, 'settings.bthold', 'BT Hold Time (×100ms)',
-             RadioSettingValueInteger(0, 255, s[40]))
-        _add(bt, 'settings.btrxdly', 'BT RX Delay (×500ms)',
-             RadioSettingValueInteger(
-                 0, 9, min(s[41] // 500, 9) if s[41] else 0))
-        _add(bt, 'settings.btmic', 'BT Mic Volume',
-             RadioSettingValueInteger(0, 255, s[42]))
-        _add(bt, 'settings.btspk', 'BT Speaker Volume',
-             RadioSettingValueInteger(0, 255, s[43]))
-        bt_pwd = bytes(s[44:48]).decode(
-            'ascii', errors='replace').rstrip('\x00\xff')
-        _add(bt, 'settings.btpassword', 'BT Password',
-             RadioSettingValueString(0, 4, bt_pwd[:4], False,
-                                     chirp_common.CHARSET_ASCII))
-        bt_name = _decode_name(bytes(s[96:112]))
-        _add(bt, 'settings.bluetname', 'BT Device Name',
-             RadioSettingValueString(0, 8, bt_name[:8], False, _CHARSET))
-        pair_name = _decode_name(bytes(s[112:128]))
-        _add(bt, 'settings.pairname', 'BT Pair Name',
-             RadioSettingValueString(0, 8, pair_name[:8], False, _CHARSET))
 
         # ── Boot Screen ──────────────────────────────────────────────────────
         if _PIL_AVAILABLE:
@@ -1698,14 +1839,12 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         def _add(path, lbl, val_obj):
             group.append(RadioSetting(path, lbl, val_obj))
 
-        rx_hz = _decode_freq_le(raw[0:4])
-        tx_hz = _decode_freq_le(raw[4:8])
+        rx_hz = min(520_000_000, max(1_000_000, _decode_freq_le(raw[0:4])))
+        tx_hz = min(480_000_000, max(1_000_000, _decode_freq_le(raw[4:8])))
         _add('%s.rxfreq' % prefix, '%s RX Freq (Hz)' % label,
-             RadioSettingValueInteger(1_000_000, 480_000_000,
-                                      max(1_000_000, rx_hz)))
+             RadioSettingValueInteger(1_000_000, 520_000_000, rx_hz))
         _add('%s.txfreq' % prefix, '%s TX Freq (Hz)' % label,
-             RadioSettingValueInteger(1_000_000, 480_000_000,
-                                      max(1_000_000, tx_hz)))
+             RadioSettingValueInteger(1_000_000, 480_000_000, tx_hz))
 
         tx_mode, tx_val, tx_pol = _decode_tone(raw[10], raw[11])
         rx_mode, rx_val, rx_pol = _decode_tone(raw[8], raw[9])
@@ -1811,8 +1950,7 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         elif name == 'settings.chbzone':
             _wb(7, int(val))
         elif name == 'settings.backlight':
-            idx = int(val)
-            _wb(8, idx + 4 if idx > 0 else 0)
+            _wb(8, int(val))
         elif name == 'settings.blightlv':
             _wb(9, int(val) + 1)
         elif name == 'settings.chadispmode':
@@ -1829,6 +1967,16 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             _wb(13, int(val))
         elif name == 'settings.voxlv':
             _wb(14, int(val) + 1)
+        elif name == 'settings.voxdettime':
+            _wb(15, int(val) * 5 + 10)
+        elif name == 'settings.posave':
+            _wb(16, int(val))
+        elif name == 'settings.posavedly':
+            _wb(17, int(val))
+        elif name == 'settings.hz1750':
+            _wb(26, int(val))
+        elif name == 'settings.noaach':
+            _wb(30, int(val))
         elif name == 'settings.apo':
             _wb(20, int(val))
         elif name == 'settings.tot':
@@ -1886,16 +2034,17 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             elif name == 'settings.gpsreq':
                 b35 = (b35 & 0xF7) | (0x08 if bool(val) else 0)
             _wb(35, b35)
-        elif name in ('settings.bluetooth', 'settings.btpair'):
-            b36 = _b(36)
-            if name == 'settings.bluetooth':
-                b36 = (b36 & 0x7F) | (0x80 if bool(val) else 0)
-            else:
-                b36 = (b36 & 0x9F) | ((int(val) & 0x03) << 5)
-            _wb(36, b36)
-        elif name in ('settings.langsel', 'settings.pownface'):
+        elif name in ('settings.reord', 'settings.recordmode',
+                      'settings.tianqi', 'settings.langsel',
+                      'settings.pownface'):
             b37 = _b(37)
-            if name == 'settings.langsel':
+            if name == 'settings.reord':
+                b37 = (b37 & 0x7F) | (0x80 if bool(val) else 0)
+            elif name == 'settings.recordmode':
+                b37 = (b37 & 0x9F) | ((int(val) & 0x03) << 5)
+            elif name == 'settings.tianqi':
+                b37 = (b37 & 0xF7) | (0x08 if bool(val) else 0)
+            elif name == 'settings.langsel':
                 b37 = (b37 & 0xFB) | ((int(val) & 1) << 2)
             else:
                 b37 = (b37 & 0xFC) | (int(val) & 0x03)
@@ -1917,21 +2066,6 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             elif name == 'settings.enhancefunc':
                 b38 = (b38 & 0xFE) | (1 if bool(val) else 0)
             _wb(38, b38)
-        elif name == 'settings.bthold':
-            _wb(40, int(val))
-        elif name == 'settings.btrxdly':
-            _wb(41, int(val) * 500)
-        elif name == 'settings.btmic':
-            _wb(42, int(val))
-        elif name == 'settings.btspk':
-            _wb(43, int(val))
-        elif name == 'settings.btpassword':
-            pwd = str(val).encode(
-                'ascii', errors='replace')[
-                :4].ljust(
-                4, b'\x00')
-            for i, b in enumerate(pwd):
-                _wb(44 + i, b)
         elif name == 'settings.skey1':
             _wb(48, int(val))
         elif name == 'settings.skey2':
@@ -1966,15 +2100,6 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             enc = _encode_name(str(val), 16)
             for i, b in enumerate(enc):
                 _wb(80 + i, b)
-        elif name == 'settings.bluetname':
-            enc = _encode_name(str(val), 16)
-            for i, b in enumerate(enc):
-                _wb(96 + i, b)
-        elif name == 'settings.pairname':
-            enc = _encode_name(str(val), 16)
-            for i, b in enumerate(enc):
-                _wb(112 + i, b)
-
         # ── VFO A / B ────────────────────────────────────────────────────────
         elif name.startswith('vfo_a.') or name.startswith('vfo_b.'):
             vfo_idx = 0 if name.startswith('vfo_a.') else 1
@@ -2019,6 +2144,8 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             zi = int(name.split('zones.zone')[1].split('_')[0])
             enc = _encode_name(str(val), 16)
             _mwrite(self._mmap, ADDR_ZONES + zi * 152 + 136, enc)
+        elif name.startswith('zones.zone') and '_preview' in name:
+            pass  # read-only display field
         elif name.startswith('zones.zone') and '_chns' in name:
             zi = int(name.split('zones.zone')[1].split('_')[0])
             base = ADDR_ZONES + zi * 152
@@ -2269,6 +2396,7 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             base = ADDR_EMERG + ei * 16
             _field_map = {
                 'dur': 0, 'chsel': 1, 'rxtime': 2, 'txtime': 3,
+                'exgtime': 4, 'grpno': 5,
                 'mode': 6, 'type': 7, 'chn': 14, 'zone': 15,
             }
             if field in _field_map:
@@ -2322,6 +2450,11 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
                 _mwb(self._mmap, base + 16, int(val))
             elif field == 'codedly':
                 _mwb(self._mmap, base + 17, int(val))
+            elif field == 'ctdcs':
+                m, v, p = self._str_to_tone(str(val))
+                th, tl = _encode_tone(m, v, p)
+                _mwb(self._mmap, base + 18, th)
+                _mwb(self._mmap, base + 19, tl)
             elif field in ('beacon', 'heighttype', 'pttid',
                            'encodetype', 'micetype'):
                 b92 = _mb(self._mmap, base + 92)
@@ -2374,8 +2507,26 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
                 _mwb(self._mmap, base + 24 + ai * 8 + 6, int(val))
             elif field.startswith('txfreq'):
                 ai = int(field[6:])
+                try:
+                    freq_hz = int(round(float(str(val).strip()) * 1_000_000))
+                except ValueError:
+                    freq_hz = 0
                 _mwrite(self._mmap, base + 168 + ai * 4,
-                        _encode_freq_le(int(val)))
+                        _encode_freq_le(freq_hz))
+            elif field == 'rxcscount':
+                _mwb(self._mmap, base + 22, int(val))
+            elif field.startswith('rxcsfilt'):
+                ai = int(field[8:])
+                _mwb(self._mmap, base + 200 + ai * 8 + 7,
+                     1 if bool(val) else 0)
+            elif field.startswith('rxcsid'):
+                ai = int(field[6:])
+                _mwb(self._mmap, base + 200 + ai * 8 + 6, int(val))
+            elif field.startswith('rxcs'):
+                ai = int(field[4:])
+                enc = str(val).encode('ascii', errors='replace')[:6]
+                enc = enc.ljust(6, b'\x20')
+                _mwrite(self._mmap, base + 200 + ai * 8, enc)
 
         # ── GPS Book ─────────────────────────────────────────────────────────
         elif name.startswith('gps_book.'):
