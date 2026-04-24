@@ -395,17 +395,18 @@ def _upload_boot_screen_5rh(radio, img_data):
     status.msg = 'Boot screen: connecting...'
     radio.status_fn(status)
 
-    # Step 1: wake pulse
+    # Step 1: wake pulse — Picture mode ACKs with 0xE0 (normal mode uses 0x41)
+    _BS_WAKE_ACKS = (0x41, 0xE0)
     pipe.write(_T_INFO)
     pipe.timeout = 1.0
     b = pipe.read(1)
-    if not b or b[0] != 0x41:
+    if not b or b[0] not in _BS_WAKE_ACKS:
         # Try 115200
         pipe.baudrate = BAUD_FALLBACK
         pipe.write(_T_INFO)
         pipe.timeout = 1.0
         b = pipe.read(1)
-        if not b or b[0] != 0x41:
+        if not b or b[0] not in _BS_WAKE_ACKS:
             raise errors.RadioError('Boot screen: no ACK after wake pulse')
 
     # Step 2: send "Picture\xFF" magic
