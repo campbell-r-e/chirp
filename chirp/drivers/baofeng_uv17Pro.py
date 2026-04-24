@@ -2157,6 +2157,8 @@ class BaofengUV5RMPlus(BF5RM):
     _has_pilot_tone = True
     _has_send_id_delay = True
     _has_scramble = True
+    _has_gps = True
+    _has_voxsw = True
 
 
 @directory.register
