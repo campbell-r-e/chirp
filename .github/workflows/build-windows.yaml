@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - 5rh-pro
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows EXE (PyInstaller)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install wxPython pyserial requests yattag suds lark pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          python -m PyInstaller --clean --noconfirm packaging/chirp_windows.spec
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          mkdir -p release
+          cp dist/CHIRP.exe "release/CHIRP-5rh-pro-${SHORT_SHA}-Windows.exe"
+          ls -lh release/
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHIRP-5rh-pro-Windows-EXE
+          path: release/CHIRP-5rh-pro-*-Windows.exe
+          retention-days: 30
