@@ -166,6 +166,8 @@ LIST_5TONE_STAND = [
     'CCIR1', 'CCIR2', 'PCCIR', 'EEA', 'EIA', 'EURO',
     'NATEL', 'MODAT',
 ]
+LIST_5TONE_CODETIME = ['70 ms', '80 ms', '90 ms', '100 ms', '110 ms', '120 ms']
+LIST_5TONE_SCALL = ['Normal', 'Group', 'ANI', 'PTT ID']
 LIST_MDC_SYNC = ['Continuous', '40 ms', '80 ms', '120 ms']
 LIST_2TONE_DEC_RSP = ['None', 'Alarm', 'TX Alarm']
 
@@ -248,6 +250,41 @@ def _encode_freq_le(hz):
     return struct.pack('<I', hz // 10)
 
 
+# ── 5-Tone packed-nibble helpers ────────────────────────────────────────
+# Digits: 0-9 → '0'-'9', 10 → 'A', 11 → 'B', 12 → 'C', 13 → 'D',
+#         14 → '*', 15 → '#'
+_5TONE_DIGIT = '0123456789ABCD*#'
+
+
+def _decode_5tone_id(raw_bytes, code_len):
+    """Decode packed-nibble 5-tone IDs to string (hi nibble first)."""
+    result = ''
+    for i in range(min(code_len, len(raw_bytes) * 2)):
+        byte_idx = i // 2
+        if i % 2 == 0:
+            nib = (raw_bytes[byte_idx] >> 4) & 0x0F
+        else:
+            nib = raw_bytes[byte_idx] & 0x0F
+        result += _5TONE_DIGIT[nib]
+    return result
+
+
+def _encode_5tone_id(s, max_bytes=20):
+    """Encode a digit string to packed-nibble bytes (hi nibble first)."""
+    buf = bytearray(max_bytes)
+    for i, ch in enumerate(s[:max_bytes * 2]):
+        if ch in _5TONE_DIGIT:
+            nib = _5TONE_DIGIT.index(ch)
+        else:
+            nib = 0
+        byte_idx = i // 2
+        if i % 2 == 0:
+            buf[byte_idx] = (buf[byte_idx] & 0x0F) | (nib << 4)
+        else:
+            buf[byte_idx] = (buf[byte_idx] & 0xF0) | nib
+    return bytes(buf)
+
+
 # ── GB2312 byte-swapped string helpers ──────────────────────────────────
 
 def _decode_name(raw16):
@@ -267,6 +304,8 @@ def _encode_name(text, maxbytes=16):
         encoded = text.encode('gb2312')[:maxbytes]
     except (UnicodeEncodeError, LookupError):
         encoded = text.encode('ascii', errors='replace')[:maxbytes]
+    if not encoded:
+        return b'\x00' * maxbytes
     return encoded.ljust(maxbytes, b'\xFF')
 
 
@@ -1109,9 +1148,10 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
              RadioSettingValueList(_zone_labels,
                                    current_index=min(s[7], 9)))
 
+        blight_idx = 0 if s[8] < 5 else min(s[8] - 4, 26)
         _add(basic, 'settings.backlight', 'Backlight Time',
              RadioSettingValueList(LIST_BACKLIGHT,
-                                   current_index=min(s[8], 26)))
+                                   current_index=blight_idx))
         _add(basic, 'settings.blightlv', 'Backlight Level',
              RadioSettingValueList(LIST_BLIGHT_LV,
                                    current_index=max(0, min(s[9] - 1, 4))))
@@ -1476,6 +1516,11 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             base = ADDR_5TONE_ENC + fi * 32
             ep = _mread(self._mmap, base, 32)
             stand = min(ep[0], len(LIST_5TONE_STAND) - 1)
+            ct_raw = ep[1]
+            ct_idx = min(max(ct_raw - 7, 0), len(LIST_5TONE_CODETIME) - 1)
+            code_len = min(ep[2], 24)
+            id_str = _decode_5tone_id(bytes(ep[3:23]), code_len)
+            scall = min(ep[23], len(LIST_5TONE_SCALL) - 1)
             name_raw = bytes(ep[24:32])
             fname = ''
             for b in name_raw:
@@ -1488,6 +1533,20 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             _add(fivetone, 'fivetone_enc.%d_stand' % fi,
                  '5-Tone %d Standard' % (fi + 1),
                  RadioSettingValueList(LIST_5TONE_STAND, current_index=stand))
+            _add(fivetone, 'fivetone_enc.%d_codetime' % fi,
+                 '5-Tone %d Code Time' % (fi + 1),
+                 RadioSettingValueList(LIST_5TONE_CODETIME,
+                                       current_index=ct_idx))
+            _add(fivetone, 'fivetone_enc.%d_codelen' % fi,
+                 '5-Tone %d Code Length' % (fi + 1),
+                 RadioSettingValueInteger(0, 24, code_len))
+            _add(fivetone, 'fivetone_enc.%d_id' % fi,
+                 '5-Tone %d Code IDs' % (fi + 1),
+                 RadioSettingValueString(0, 40, id_str, False,
+                                         chirp_common.CHARSET_ASCII))
+            _add(fivetone, 'fivetone_enc.%d_scall' % fi,
+                 '5-Tone %d Special Call' % (fi + 1),
+                 RadioSettingValueList(LIST_5TONE_SCALL, current_index=scall))
             _add(fivetone, 'fivetone_enc.%d_name' % fi,
                  '5-Tone %d Name' % (fi + 1),
                  RadioSettingValueString(0, 8, fname[:8], False,
@@ -1950,7 +2009,8 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
         elif name == 'settings.chbzone':
             _wb(7, int(val))
         elif name == 'settings.backlight':
-            _wb(8, int(val))
+            v = int(val)
+            _wb(8, 0 if v == 0 else v + 4)
         elif name == 'settings.blightlv':
             _wb(9, int(val) + 1)
         elif name == 'settings.chadispmode':
@@ -2303,6 +2363,14 @@ class BaofengUV5RMPlusGPS(chirp_common.CloneModeRadio):
             base = ADDR_5TONE_ENC + fi * 32
             if field == 'stand':
                 _mwb(self._mmap, base, int(val))
+            elif field == 'codetime':
+                _mwb(self._mmap, base + 1, int(val) + 7)
+            elif field == 'codelen':
+                _mwb(self._mmap, base + 2, int(val))
+            elif field == 'id':
+                _mwrite(self._mmap, base + 3, _encode_5tone_id(str(val)))
+            elif field == 'scall':
+                _mwb(self._mmap, base + 23, int(val))
             elif field == 'name':
                 enc = str(val).encode('ascii', errors='replace')[:8]
                 enc = enc.ljust(8, b'\x00')
