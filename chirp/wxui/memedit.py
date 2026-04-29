@@ -1227,7 +1227,14 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
         data = self.cb_copy_getdata()
         ds = wx.DropSource(self)
         ds.SetData(data)
-        result = ds.DoDragDrop(wx.Drag_AllowMove)
+        # Release any stale mouse capture before starting the drag to avoid
+        # a wxWidgets assertion on macOS when a prior drag left capture held.
+        if self.HasCapture():
+            self.ReleaseMouse()
+        try:
+            result = ds.DoDragDrop(wx.Drag_AllowMove)
+        except Exception:
+            result = wx.DragCancel
         if result in (wx.DragMove, wx.DragCopy):
             LOG.debug('Target took our memories')
         else:

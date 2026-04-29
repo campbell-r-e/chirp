@@ -147,7 +147,20 @@ def chirpmain():
     # This must be imported before wx.App() to squelch warnings on startup
     # about duplicate "Windows bitmap file" handlers
     import wx.richtext
-    app = wx.App()
+
+    class _ChirpApp(wx.App):
+        if sys.platform == 'darwin':
+            def OnExceptionInMainLoop(self):
+                # wxPython 4.2.x on macOS spuriously fires CaptureMouse
+                # assertions from AuiNotebook tab events. Swallow those
+                # silently so they don't spam the terminal or crash the loop.
+                _, exc, _ = sys.exc_info()
+                if (isinstance(exc, wx._core.wxAssertionError) and
+                        'CaptureMouse' in str(exc)):
+                    return
+                raise
+
+    app = _ChirpApp()
     if args.force_language:
         force_lang = wx.Locale.FindLanguageInfo(args.force_language)
         if force_lang is None:

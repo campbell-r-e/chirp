@@ -520,7 +520,14 @@ class ChirpMain(wx.Frame):
         data.Add(d)
         ds = wx.DropSource(self)
         ds.SetData(data)
-        result = ds.DoDragDrop(wx.Drag_AllowMove)
+        # Release any stale mouse capture before starting the drag to avoid
+        # a wxWidgets assertion on macOS when a prior drag left capture held.
+        if self.HasCapture():
+            self.ReleaseMouse()
+        try:
+            result = ds.DoDragDrop(wx.Drag_AllowMove)
+        except Exception:
+            result = wx.DragCancel
         if result == wx.DragMove:
             LOG.debug('Target took our window')
             self._update_window_for_editor()
