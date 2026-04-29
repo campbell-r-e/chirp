@@ -2064,7 +2064,7 @@ class BF5RM(UV17Pro):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._boot_image_path = ""
-        self._boot_image_data = None  # RGB565 bytes, set by set_settings()
+        self._boot_image_data = None  # RGB565 bytes, populated by set_settings()
 
     def get_settings(self):
         settings = super().get_settings()
@@ -2157,6 +2157,8 @@ class BaofengUV5RMPlus(BF5RM):
     _has_pilot_tone = True
     _has_send_id_delay = True
     _has_scramble = True
+    _has_gps = True
+    _has_voxsw = True
 
 
 @directory.register
